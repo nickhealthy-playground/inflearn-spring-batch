@@ -7,6 +7,7 @@
 ## 해당 프로젝트에서 배우는 내용
 
 * 섹션 3 | 스프링 배치 시작
+* 섹션 4 | 스프링 배치 도메인 이해
 
 
 
@@ -196,5 +197,128 @@ spring:
 | 자동 실행이 조용히 빠짐 | `spring.batch.job.enabled=false` 면 runner 빈 자체가 만들어지지 않아 에러 없이 아무 Job도 실행되지 않는다. `--debug` 조건 평가 리포트의 `BatchAutoConfiguration#jobLauncherApplicationRunner` 항목으로 확인한다 |
 | 메타데이터 DB 공유 금지 | Batch 4와 5 이상은 스키마가 달라 한 DB를 같이 쓰면 깨진다. 이 저장소는 `batch4`/`batch6` 으로 나눴다 |
 | 1:N 관계는 DDL이 아니라 프레임워크가 보장 | DDL에는 "인스턴스에 실행이 최소 하나" 같은 제약이 없다. 4.3.3은 인스턴스와 첫 실행을 한 트랜잭션에서 함께 만들어서 실행 없는 인스턴스가 생기지 않는다 |
+
+</details>
+
+
+
+# 섹션 4 | 스프링 배치 도메인 이해
+
+<details>
+<summary><b>핵심 정리 펼쳐보기</b></summary>
+
+<br>
+
+> 배치를 **구성하는 객체**(`Job`·`Step`)와, 실행할 때마다 만들어져 메타데이터 테이블에 저장되는 **실행 객체**(`JobInstance`·`JobExecution`·`StepExecution`·`ExecutionContext`)를 나눠서 본다.
+> `JobLauncher` 가 Job을 실행하고 `JobRepository` 가 실행 상태를 기록하며, 그 기록으로 완료된 작업의 재실행을 막고 실패한 Step부터 재시작한다.
+> (사용 버전: Spring Batch 4.3.3)
+
+### 한눈에 보기
+
+| 구분 | 객체 | 핵심 | 테이블 |
+|---|---|---|---|
+| 구성 | `Job` | 배치 작업의 최상위 단위. `SimpleJob`(Step 순차 실행), `FlowJob`(조건 분기) | - |
+| 구성 | `Step` | Job의 한 단계. `TaskletStep`·`PartitionStep`·`JobStep`·`FlowStep` | - |
+| 실행 | `JobInstance` | Job 이름 + identifying 파라미터로 구분되는 논리적 실행 단위 | `BATCH_JOB_INSTANCE` |
+| 실행 | `JobParameters` | JobInstance를 구분하고 Step에 값을 전달. String·Date·Long·Double 4종 | `BATCH_JOB_EXECUTION_PARAMS` |
+| 실행 | `JobExecution` | JobInstance의 실행 시도 1번. 실패 후 다시 실행하면 같은 인스턴스에 새 JobExecution | `BATCH_JOB_EXECUTION` |
+| 실행 | `StepExecution` | Step의 실행 시도 1번. 읽기·쓰기·커밋·롤백 카운트를 가짐 | `BATCH_STEP_EXECUTION` |
+| 실행 | `StepContribution` | 청크(트랜잭션) 하나의 변경분. 커밋할 때 `StepExecution` 에 합산 | - |
+| 실행 | `ExecutionContext` | Job·Step 범위의 key-value 저장소. 직렬화해서 저장하고 재시작 시 복원 | `BATCH_*_EXECUTION_CONTEXT` |
+| 인프라 | `JobRepository` | 실행 객체의 저장·조회·갱신 | `BATCH_` 테이블 전체 |
+| 인프라 | `JobLauncher` | `run(job, jobParameters)` 로 Job 실행. 구현체 `SimpleJobLauncher` | - |
+
+### JobInstance가 만들어지는 조건 (`SimpleJobRepository#createJobExecution`)
+
+| 같은 Job 이름 + 같은 identifying 파라미터로 실행할 때 | 결과 |
+|---|---|
+| 처음 실행 | JobInstance + JobExecution 생성 |
+| 이전 실행이 `COMPLETED` (또는 `ABANDONED`) | `JobInstanceAlreadyCompleteException` |
+| 이전 실행이 `FAILED`·`STOPPED` | 같은 JobInstance에 새 JobExecution (재시작), 이전 Job `ExecutionContext` 를 이어받음 |
+| 이전 실행이 아직 실행 중 | `JobExecutionAlreadyRunningException` |
+| identifying 파라미터가 하나도 없음 | 완료된 인스턴스여도 예외 없이 같은 인스턴스에 실행이 추가된다 |
+
+### BatchStatus vs ExitStatus
+
+| 구분 | `BatchStatus` | `ExitStatus` |
+|---|---|---|
+| 의미 | 프레임워크가 관리하는 실행 상태 | 실행 결과 코드. Flow 조건 분기에 쓰고 직접 정의할 수 있음 |
+| 값 | `STARTING`, `STARTED`, `STOPPING`, `STOPPED`, `FAILED`, `COMPLETED`, `ABANDONED`, `UNKNOWN` | `UNKNOWN`, `EXECUTING`, `COMPLETED`, `NOOP`, `FAILED`, `STOPPED` |
+| 컬럼 | `STATUS` | `EXIT_CODE`, `EXIT_MESSAGE` |
+| Job 결과 | `SimpleJob` 은 마지막으로 실행한 Step의 상태를 Job의 상태로 올린다 | 마지막 Step의 종료 코드를 Job의 종료 코드로 쓴다 |
+
+### JobParameters 전달과 조회
+
+| 방법 | 예시 | 비고 |
+|---|---|---|
+| 코드 | `new JobParametersBuilder().addString("name", "user2").addLong("seq", 1L).toJobParameters()` | `ApplicationRunner` 에서 `jobLauncher.run(job, params)` (`JobRunner`) |
+| 명령행 | `name=user1 'seq(long)=1' 'date(date)=2026/11/12' 'age(double)=16.5'` | `DefaultJobParametersConverter` 의 키 접미사 규칙. SpEL이 아니다. 앞에 `-` 를 붙이면 non-identifying |
+
+```java
+// StepExecution → JobExecution → JobParameters (타입별 getter)
+JobParameters jobParameters = contribution.getStepExecution().getJobExecution().getJobParameters();
+String name = jobParameters.getString("name");
+
+// ChunkContext → StepContext → Map (값만 꺼냄)
+Map<String, Object> parametersMap = chunkContext.getStepContext().getJobParameters();
+```
+
+### ExecutionContext 범위
+
+| 범위 | 공유 | 꺼내는 방법 |
+|---|---|---|
+| Job | 같은 JobExecution의 모든 Step이 공유 | `stepExecution.getJobExecution().getExecutionContext()` |
+| Step | 해당 Step 안에서만 | `stepExecution.getExecutionContext()` |
+
+```java
+// ExecutionContextTasklet3: 첫 실행은 Job 컨텍스트에 값을 남기고 실패
+if (jobExecutionContext.get("name") == null) {
+    jobExecutionContext.put("name", "user1");
+    throw new RuntimeException("step3 was failed");
+}
+// 같은 파라미터로 재시작 → step1·2는 COMPLETED라 건너뛰고, step3은 복원된 name을 보고 통과
+```
+
+### JobRepository 설정 (`CustomBatchConfigurer`)
+
+| 설정 | 기본값 | 내용 |
+|---|---|---|
+| `setIsolationLevelForCreate()` | `ISOLATION_SERIALIZABLE` | `create*` 메서드의 격리 수준. 같은 Job을 동시에 실행해도 JobInstance가 중복 생성되지 않게 한다 |
+| `setTablePrefix()` | `BATCH_` | 조회·저장에 쓰는 테이블 이름 접두어 |
+| `setMaxVarCharLength()` | 2500 | `EXIT_MESSAGE` 같은 긴 문자열 컬럼에 저장할 최대 길이 |
+
+부트 2.5에서는 `BasicBatchConfigurer` 를 상속해 `createJobRepository()` 를 재정의한다. `JobRepository` 의 트랜잭션은 `create*` 가 `REQUIRES_NEW` + 위 격리 수준, 나머지는 `REQUIRED` 다.
+
+### JobLauncher 동기 / 비동기
+
+| 구분 | `TaskExecutor` | `run()` 반환 시점 |
+|---|---|---|
+| 동기 (기본) | `SyncTaskExecutor` | Job이 끝난 뒤. 최종 상태가 담긴 `JobExecution` |
+| 비동기 | `SimpleAsyncTaskExecutor` 등 | 바로 반환. 아직 실행 중인 `JobExecution` (HTTP 요청에서 Job을 띄울 때) |
+
+### 동작 원리
+
+| 동작 | 실제로 일어나는 일 |
+|---|---|
+| 실행 요청 | `SimpleJobLauncher.run()` → 마지막 실행 조회(재시작 가능 여부·실행 중 여부) → 파라미터 검증 → `jobRepository.createJobExecution()` |
+| 인스턴스·실행 생성 | `createJobExecution()` 호출 하나에서 JobInstance(없을 때)·JobExecution·Job `ExecutionContext` 를 저장. `REQUIRES_NEW` 트랜잭션이라 함께 커밋된다 |
+| Step 실행 준비 | `SimpleStepHandler` 가 StepExecution을 만든다. 이전 실행이 `COMPLETED` 면 건너뛰고(`allowStartIfComplete=false`), 실패였으면 이전 Step `ExecutionContext` 를 복원 |
+| 청크 커밋 | `TaskletStep` 이 트랜잭션마다 `stepExecution.apply(contribution)` 으로 카운트를 합산하고 Step `ExecutionContext`·`StepExecution` 을 저장 |
+| Step 종료 후 | Job `ExecutionContext` 저장 (`jobRepository.updateExecutionContext(execution)`). Step이 실패해도 저장되므로 재시작 때 값이 남아 있다 |
+| 주입받는 객체 | `@EnableBatchProcessing` 이 등록한 `JobLauncher`·`JobRepository` 는 지연 프록시라 `SimpleJobLauncher` 로 캐스팅할 수 없다 → `BasicBatchConfigurer#getJobLauncher()` 로 실제 객체를 꺼낸다 (`JobLauncherController`) |
+
+### 주의사항
+
+| 주의 | 내용 |
+|---|---|
+| 없는 키 조회 | `jobParameters.getLong("없는키")` 는 예외 없이 `null` 을 반환한다. 키 오타가 조용히 넘어간다 |
+| 명령행 날짜 형식 | `(date)` 는 `yyyy/MM/dd` 고정. `2026-11-12` 처럼 쓰면 `Date format is invalid` 로 기동이 실패한다 |
+| zsh에서 `( )` | zsh는 `seq(long)=1` 을 glob 패턴으로 보고 `no matches found` 로 명령을 실행하지 않는다 → 따옴표로 감싼다. IntelliJ Program arguments는 쉘을 거치지 않아 괜찮다 |
+| 명령행 인자 구분 | `--` 로 시작하면 스프링 프로퍼티, 나머지 `key=value` 만 JobParameters. `=` 가 없는 인자는 조용히 버려진다 |
+| 파라미터 없는 Job | identifying 파라미터가 없으면 완료 후 다시 실행해도 막히지 않는다. 재실행을 막고 싶으면 날짜 같은 파라미터를 넣는다 |
+| `tablePrefix` | 접두어를 바꾸면 그 이름의 테이블을 조회할 뿐 테이블을 만들지 않는다. `SYSTEM_JOB_EXECUTION` 같은 테이블이 실제로 있어야 한다 |
+| `ExecutionContext` 값 | 직렬화해서 DB에 저장된다(4.3.3 기본 `Jackson2ExecutionContextStringSerializer`). 큰 객체나 민감 정보는 넣지 않는다 |
+| 공유 `JobLauncher` 변경 | 실습처럼 `SimpleJobLauncher` 의 `TaskExecutor` 를 요청마다 바꾸면 같은 빈을 쓰는 모든 실행이 비동기가 된다. 비동기 전용 `JobLauncher` 빈을 따로 둔다 |
+| in-memory 저장소 | `MapJobRepositoryFactoryBean` 은 4.3에서 deprecated. 테스트도 H2 같은 DB와 `JobRepositoryFactoryBean` 을 쓴다 |
 
 </details>
