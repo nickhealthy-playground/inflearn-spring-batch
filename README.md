@@ -8,6 +8,7 @@
 
 * 섹션 3 | 스프링 배치 시작
 * 섹션 4 | 스프링 배치 도메인 이해
+* 섹션 5 | 스프링 배치 실행 - Job
 
 
 
@@ -320,5 +321,132 @@ if (jobExecutionContext.get("name") == null) {
 | `ExecutionContext` 값 | 직렬화해서 DB에 저장된다(4.3.3 기본 `Jackson2ExecutionContextStringSerializer`). 큰 객체나 민감 정보는 넣지 않는다 |
 | 공유 `JobLauncher` 변경 | 실습처럼 `SimpleJobLauncher` 의 `TaskExecutor` 를 요청마다 바꾸면 같은 빈을 쓰는 모든 실행이 비동기가 된다. 비동기 전용 `JobLauncher` 빈을 따로 둔다 |
 | in-memory 저장소 | `MapJobRepositoryFactoryBean` 은 4.3에서 deprecated. 테스트도 H2 같은 DB와 `JobRepositoryFactoryBean` 을 쓴다 |
+
+</details>
+
+
+
+# 섹션 5 | 스프링 배치 실행 - Job
+
+<details>
+<summary><b>핵심 정리 펼쳐보기</b></summary>
+
+<br>
+
+> 스프링 부트가 기동할 때 Job을 실행하는 방식(`JobLauncherApplicationRunner`)과, `JobBuilderFactory` → `SimpleJobBuilder` 로 Job을 만드는 API를 다룬다.
+> `SimpleJob` 은 Step을 순서대로 실행하고, `validator()`·`preventRestart()`·`incrementer()`·`listener()` 로 실행 전후 동작을 붙인다.
+> (사용 버전: Spring Boot 2.5.2, Spring Batch 4.3.3)
+
+### 한눈에 보기
+
+| 구분 | API | 핵심 |
+|---|---|---|
+| 기동 시 실행 | `spring.batch.job.enabled` | 기본 `true`. `false` 면 runner 빈이 등록되지 않음 |
+| 기동 시 실행 | `spring.batch.job.names` | 실행할 Job 이름(쉼표 구분, 패턴 가능). 비어 있으면 컨텍스트의 모든 Job 실행 |
+| 빌더 | `jobBuilderFactory.get(name)` | `new JobBuilder(name).repository(jobRepository)` |
+| 빌더 | `start(Step)` / `start(Flow)` | `SimpleJobBuilder` → `SimpleJob` / `JobFlowBuilder` → `.end()` → `FlowJob` |
+| SimpleJob | `next(Step)` | 다음 Step. 앞 Step이 `COMPLETED` 일 때만 실행 |
+| SimpleJob | `validator()` | JobParameters 검증 |
+| SimpleJob | `preventRestart()` | 재시작 금지 (`restartable = false`) |
+| SimpleJob | `incrementer()` | 다음 실행에 쓸 JobParameters 생성 |
+| SimpleJob | `listener()` | `JobExecutionListener` 의 `beforeJob` / `afterJob` |
+
+### 배치 초기화 설정 (`JobLauncherApplicationRunner`)
+
+| 항목 | 동작 |
+|---|---|
+| 실행 시점 | `ApplicationRunner` 라서 컨텍스트 refresh가 끝난 뒤 실행 |
+| 실행 대상 | `spring.batch.job.names` 와 일치하는 Job만. 일치하지 않는 Job은 DEBUG 로그(`Skipped job`)만 남기고 건너뜀 |
+| JobParameters | `--` 가 없는 인자(`getNonOptionArgs()`)만 `=` 기준으로 나눠 `DefaultJobParametersConverter` 로 변환 |
+| incrementer 적용 | Job에 incrementer가 있으면 마지막 인스턴스의 파라미터로 `getNext()` 를 호출하고, 명령행 값으로 덮어써서 실행 |
+| 실패한 인스턴스 재실행 | 같은 파라미터의 인스턴스가 `FAILED`·`STOPPED` 이고 재시작 가능하면 이전 identifying 파라미터를 이어받아 재시작 |
+
+### validator()
+
+| 설정 (`DefaultJobParametersValidator`) | 검증 |
+|---|---|
+| `requiredKeys` | 하나라도 없으면 `JobParametersInvalidException` |
+| `optionalKeys` 가 비어 있지 않음 | `requiredKeys` ∪ `optionalKeys` 에 없는 키가 있으면 예외 |
+| `optionalKeys` 가 비어 있음 | `requiredKeys` 외의 키는 검사하지 않음 |
+
+```java
+return this.jobBuilderFactory.get("ValidatorConfiguration")
+        // .validator(new CustomJobParametersValidator())   // JobParametersValidator 직접 구현
+        .validator(new DefaultJobParametersValidator(new String[]{"name", "date"}, new String[]{"year"}))
+        .start(step1())
+        .next(step2())
+        .next(step3())
+        .build();
+```
+
+검증은 두 번 호출된다. `SimpleJobLauncher.run()` 에서 실행을 만들기 전에 한 번, `AbstractJob.execute()` 시작할 때 한 번.
+
+### preventRestart()
+
+| 같은 파라미터로 다시 실행할 때 | 기본 (`restartable = true`) | `preventRestart()` |
+|---|---|---|
+| 이전 실행 실패 | 같은 인스턴스로 재시작 | `JobRestartException: JobInstance already exists and is not restartable` |
+| 이전 실행 완료 | `JobInstanceAlreadyCompleteException` | `JobRestartException` (런처가 저장소보다 먼저 검사) |
+| 새 파라미터 | 새 인스턴스 | 새 인스턴스 |
+
+실습(`PreventRestartConfiguration`)은 step3이 항상 실패하므로, 같은 파라미터로 다시 실행하면 재시작 대신 `JobRestartException` 이 난다.
+
+### incrementer()
+
+| 구현 | 동작 |
+|---|---|
+| `RunIdIncrementer` | 이전 파라미터의 `run.id` + 1 (없으면 1). 다른 파라미터도 그대로 이어받는다 |
+| `CustomJobParametersIncrementer` (실습) | `run.id` 에 현재 시각 문자열(`yyyy-MM-dd HH:mm:ss`) |
+
+```java
+public JobParameters getNext(@Nullable JobParameters parameters) {
+    String id = dateFormat.format(new Date());
+    return new JobParametersBuilder().addString("run.id", id).toJobParameters();
+}
+```
+
+### JobBuilderFactory 구조
+
+| 클래스 | 역할 |
+|---|---|
+| `JobBuilderFactory` | `get(name)` 으로 `JobBuilder` 를 만들고 `JobRepository` 를 넣어 준다 |
+| `JobBuilderHelper` | 공통 설정: `validator`, `incrementer`, `repository`, `listener`, `preventRestart` |
+| `JobBuilder` | `start(Step)` → `SimpleJobBuilder`, `start(Flow)`·`flow(Step)` → `JobFlowBuilder` |
+| `SimpleJobBuilder` | `next(Step)` 로 Step 추가, `build()` → `SimpleJob` |
+| `JobFlowBuilder` → `FlowJobBuilder` | Flow 정의 후 `.end()` → `build()` → `FlowJob` (`JobBuilderConfiguration#batchJob2`) |
+
+### 동작 원리 (SimpleJob 아키텍처)
+
+| 단계 | 실제로 일어나는 일 |
+|---|---|
+| 1. 실행 요청 | `SimpleJobLauncher.run()`: 마지막 실행 조회 → `preventRestart` 검사 → `validator` 검증 → `createJobExecution()` |
+| 2. Job 시작 | `AbstractJob.execute()`: `validator` 재검증 → 시작 시각 기록, 상태 `STARTED` → `listener.beforeJob()` |
+| 3. Step 실행 | `SimpleJob.doExecute()` 가 Step마다 `SimpleStepHandler.handleStep()` 호출 → StepExecution 생성·저장 → `step.execute()` |
+| 4. 중단 | Step 상태가 `COMPLETED` 가 아니면 남은 Step을 실행하지 않는다 |
+| 5. 결과 반영 | 마지막 Step의 `BatchStatus`·`ExitStatus` 를 JobExecution에 반영 |
+| 6. 종료 | 종료 시각 기록 → `listener.afterJob()` → `jobRepository.update(execution)` |
+
+### 버전 차이
+
+| 항목 | Batch 4.3.3 | Batch 6.0.6 |
+|---|---|---|
+| Job 생성 | `jobBuilderFactory.get(name)` | `new JobBuilder(name, jobRepository)`. 팩토리는 6.0에서 제거 |
+| 기동 시 실행할 Job | `spring.batch.job.names` (여러 개, 패턴) | `spring.batch.job.name` (하나). Job이 여러 개면 지정 필수 |
+| 명령행 파라미터 표기 | `seq(long)=1` | `seq=1,java.lang.Long` |
+| 실행 API | `JobLauncher` | `JobOperator` (`JobLauncher` deprecated) |
+| 검증 실패 시 | 인스턴스를 만들기 전에 검증 → 아무것도 남지 않음 | 인스턴스를 먼저 커밋하고 검증 → **실행 없는 인스턴스**가 남고, 같은 파라미터로 다시 실행하면 `IllegalStateException` (H2로 두 버전 실행해 확인) |
+
+### 주의사항
+
+| 주의 | 내용 |
+|---|---|
+| Job 여러 개 | 부트 2.5는 `names` 가 없으면 컨텍스트의 Job을 **모두** 같은 파라미터로 실행한다. 실습 Configuration을 하나만 켜는 이유 |
+| `names` 오타 | 일치하는 Job이 없으면 에러 없이 DEBUG 로그만 남는다 |
+| incrementer는 런처가 쓰지 않음 | `jobLauncher.run(job, params)` 를 직접 부르면 incrementer가 적용되지 않는다. 부트 runner처럼 `getNextJobParameters()` 를 거치는 경로에서만 동작 |
+| `optionalKeys` + incrementer | `optionalKeys` 를 지정했다면 `run.id` 도 `requiredKeys`·`optionalKeys` 에 넣어야 한다. 아니면 검증에서 막힌다 |
+| 무거운 검증 | validator는 실행 한 번에 두 번 호출된다. 외부 자원을 조회하는 검증은 비용도 두 번 든다 |
+| 시각 기반 `run.id` | 실습 incrementer는 초 단위라 1초 안에 두 번 실행하면 같은 `run.id` 가 되어 두 번째가 `JobInstanceAlreadyCompleteException` 으로 막힌다. `static SimpleDateFormat` 은 thread-safe하지 않다 |
+| `afterJob` 예외 | `afterJob` 에서 던진 예외는 로그만 남고 Job 상태에 반영되지 않는다 |
+| `preventRestart` 이후 | 실패한 인스턴스를 다시 돌릴 수 없으므로 파라미터를 바꿔 새 인스턴스로 실행해야 한다 |
 
 </details>
