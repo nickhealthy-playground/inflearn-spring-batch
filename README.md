@@ -9,6 +9,7 @@
 * 섹션 3 | 스프링 배치 시작
 * 섹션 4 | 스프링 배치 도메인 이해
 * 섹션 5 | 스프링 배치 실행 - Job
+* 섹션 6 | 스프링 배치 실행 - Step
 
 
 
@@ -448,5 +449,173 @@ public JobParameters getNext(@Nullable JobParameters parameters) {
 | 시각 기반 `run.id` | 실습 incrementer는 초 단위라 1초 안에 두 번 실행하면 같은 `run.id` 가 되어 두 번째가 `JobInstanceAlreadyCompleteException` 으로 막힌다. `static SimpleDateFormat` 은 thread-safe하지 않다 |
 | `afterJob` 예외 | `afterJob` 에서 던진 예외는 로그만 남고 Job 상태에 반영되지 않는다 |
 | `preventRestart` 이후 | 실패한 인스턴스를 다시 돌릴 수 없으므로 파라미터를 바꿔 새 인스턴스로 실행해야 한다 |
+
+</details>
+
+
+
+# 섹션 6 | 스프링 배치 실행 - Step
+
+<details>
+<summary><b>핵심 정리 펼쳐보기</b></summary>
+
+<br>
+
+> `StepBuilderFactory` 가 만든 `StepBuilder` 는 호출한 API에 따라 다섯 가지 하위 빌더로 갈라지고, 각각 `TaskletStep`·`PartitionStep`·`JobStep`·`FlowStep` 을 만든다.
+> `TaskletStep` 은 `Tasklet` 을 `RepeatStatus.FINISHED` 가 나올 때까지 반복 실행하며 **반복 1번 = 트랜잭션 1개** 다. Chunk 기반 Step도 내부는 `ChunkOrientedTasklet` 을 실행하는 `TaskletStep` 이다.
+> (사용 버전: Spring Batch 4.3.3)
+
+### 한눈에 보기
+
+| 구분 | API | 핵심 |
+|---|---|---|
+| 빌더 | `stepBuilderFactory.get(name)` | `new StepBuilder(name).repository(jobRepository).transactionManager(transactionManager)` |
+| Task 기반 | `tasklet(Tasklet)` | `TaskletStepBuilder` → `TaskletStep`. 직접 구현한 `Tasklet` 을 반복 실행 |
+| Chunk 기반 | `chunk(int)` + `reader`·`processor`·`writer` | `SimpleStepBuilder` → `TaskletStep` + `ChunkOrientedTasklet`. 아이템을 청크 단위로 읽고 쓴다 (섹션 8) |
+| 공통 설정 | `startLimit(int)` | 한 JobInstance 안에서 Step을 실행할 수 있는 횟수. 기본 `Integer.MAX_VALUE` |
+| 공통 설정 | `allowStartIfComplete(boolean)` | `COMPLETED` 된 Step도 재시작 때 다시 실행. 기본 `false` |
+| 공통 설정 | `listener(StepExecutionListener)` | `beforeStep` / `afterStep` |
+| JobStep | `job(Job)` + `launcher()`·`parametersExtractor()` | Step 안에서 다른 Job을 실행. 자식 Job은 별도 JobInstance로 기록 |
+
+### StepBuilderFactory → 하위 빌더 (`StepBuilderConfiguration`)
+
+| `StepBuilder` 메서드 | 하위 빌더 | 만들어지는 Step |
+|---|---|---|
+| `tasklet(Tasklet)` | `TaskletStepBuilder` | `TaskletStep` |
+| `chunk(int)` / `chunk(CompletionPolicy)` | `SimpleStepBuilder` | `TaskletStep` (`ChunkOrientedTasklet`) |
+| `partitioner(stepName, Partitioner)` / `partitioner(Step)` | `PartitionStepBuilder` | `PartitionStep` (섹션 13. 실습에서는 주석 처리) |
+| `job(Job)` | `JobStepBuilder` | `JobStep` |
+| `flow(Flow)` | `FlowStepBuilder` | `FlowStep` |
+
+공통 설정(`repository`, `transactionManager`, `startLimit`, `listener`, `allowStartIfComplete`)은 부모 클래스 `StepBuilderHelper` 에 있다.
+
+### TaskletStep: Task 기반 vs Chunk 기반 (`TaskletStepConfiguration`)
+
+| 구분 | Task 기반 (`taskStep`) | Chunk 기반 (`chunkStep`) |
+|---|---|---|
+| 설정 | `tasklet(...)` | `<String, String>chunk(3)` + `reader`·`processor`·`writer` |
+| 실행하는 Tasklet | 직접 구현한 `Tasklet` | 빌더가 만든 `ChunkOrientedTasklet` |
+| 실행 결과 (H2) | `COMMIT_COUNT=1` | 아이템 3개 → `READ_COUNT=3`, `WRITE_COUNT=3`, **`COMMIT_COUNT=2`** |
+
+chunkStep의 커밋이 2인 이유: 첫 반복에서 3개를 읽고 쓴 뒤, 다음 반복이 `null` 을 읽고 끝나는데 이 빈 반복도 트랜잭션 하나로 커밋된다. reader가 바로 `null` 을 주는 `StepBuilderConfiguration#step2` 도 `COMMIT_COUNT=1` 이다.
+
+### tasklet()
+
+| 항목 | 내용 |
+|---|---|
+| 구현 | `Tasklet#execute(StepContribution, ChunkContext)` 하나. 람다·익명 클래스·별도 클래스 모두 가능 |
+| `RepeatStatus.FINISHED` | 한 번 실행하고 Step 종료. `null` 을 반환해도 `FINISHED` 로 처리 |
+| `RepeatStatus.CONTINUABLE` | `execute()` 를 다시 호출. 호출마다 새 트랜잭션 |
+| 예외 | 트랜잭션 롤백 → Step `FAILED`, `ROLLBACK_COUNT` +1. `TaskletStep` 의 `rollbackOn()` 이 항상 `true` 라서 checked 예외도 롤백 |
+
+```java
+@Bean
+public Step step1() {
+    return stepBuilderFactory.get("step1")
+            .tasklet((contribution, chunkContext) -> {
+                System.out.println("step1 has executed");
+                return RepeatStatus.FINISHED;   // 한 번 실행하고 종료
+            })
+            .build();
+}
+```
+
+### startLimit() / allowStartIfComplete() (`Limit_AllowConfiguration`)
+
+```java
+stepBuilderFactory.get("step1").tasklet(...)
+        .allowStartIfComplete(true)   // 완료돼도 재시작 때마다 다시 실행
+        .build();
+
+stepBuilderFactory.get("step2").tasklet(...)   // 항상 RuntimeException
+        .startLimit(3)                // 최대 3번까지만 실행
+        .build();
+```
+
+| 같은 파라미터로 실행 | step1 (`allowStartIfComplete(true)`) | step2 (`startLimit(3)`) | Job |
+|---|---|---|---|
+| 1번째 | `COMPLETED` | `FAILED` | `FAILED` |
+| 2번째 | 다시 실행 → `COMPLETED` | `FAILED` | `FAILED`, 같은 JobInstance에 새 JobExecution |
+| 3번째 | 다시 실행 → `COMPLETED` | `FAILED` | `FAILED` |
+| 4번째 | 다시 실행 → `COMPLETED` | 실행 전에 `StartLimitExceededException`. StepExecution 행이 생기지 않음 | `FAILED` |
+
+`allowStartIfComplete` 가 `false`(기본)였다면 2번째부터 step1은 건너뛰고 step2부터 시작한다 (섹션 4의 재시작 동작).
+
+### JobStep (`JobStepConfiguration`)
+
+```java
+@Bean
+public Job parentJob() {
+    return this.jobBuilderFactory.get("parentJob")
+            .start(jobStep(null))   // @Configuration 프록시가 null 인자를 무시하고 jobStep 빈을 돌려준다
+            .next(step2())
+            .build();
+}
+
+@Bean
+public Step jobStep(JobLauncher jobLauncher) {
+    return this.stepBuilderFactory.get("jobStep")
+            .job(childJob())
+            .launcher(jobLauncher)
+            .listener(new StepExecutionListener() {
+                @Override
+                public void beforeStep(StepExecution stepExecution) {
+                    stepExecution.getExecutionContext().putString("name", "user1");
+                }
+                ...
+            })
+            .parametersExtractor(jobParametersExtractor())   // keys = {"name"}
+            .build();
+}
+```
+
+| 실행 (H2, 부모 파라미터 `name=parent`, `seq=1`) | 결과 |
+|---|---|
+| 정상 | `parentJob`·`childJob` 이 각각 JobInstance로 기록된다. `childJob` 파라미터는 `name=user1`, `seq=1` |
+| childJob의 step1 실패 | childJob `FAILED` → jobStep `FAILED` (`UnexpectedJobExecutionException: Step failure: the delegate Job failed in JobStep.`) → parentJob `FAILED`. step2는 실행되지 않음 |
+| 실패 후 같은 파라미터로 재실행 | parentJob·childJob 모두 **같은 JobInstance** 로 재시작 |
+
+| 자식 Job 파라미터 (`DefaultJobParametersExtractor`) | 동작 |
+|---|---|
+| `useAllParentParameters` (기본 `true`) | 부모 Job의 파라미터를 모두 복사 |
+| `keys` | 키마다 Step `ExecutionContext` 를 먼저 보고, 없으면 부모 JobParameters에서 찾는다. 같은 키면 `ExecutionContext` 값이 덮어쓴다 (`name=parent` → `user1`) |
+| 재시작 | `JobStep` 은 만든 파라미터를 Step `ExecutionContext` 에 저장해 두고, 재시작 때는 그 값을 그대로 쓴다 |
+
+### 동작 원리 (TaskletStep 아키텍처)
+
+| 단계 | 실제로 일어나는 일 |
+|---|---|
+| 1. 실행 여부 판단 | `SimpleStepHandler#shouldStart`: 이전 실행이 `COMPLETED` 이고 `allowStartIfComplete=false` 면 건너뜀 → 이 JobInstance에서 Step 실행 횟수가 `startLimit` 이상이면 `StartLimitExceededException` |
+| 2. Step 시작 | `AbstractStep#execute`: 상태 `STARTED` 저장 → `listener.beforeStep()` → `open()` |
+| 3. 반복 실행 | `TaskletStep#doExecute`: `RepeatTemplate` 이 `FINISHED` 가 나올 때까지 반복. 반복마다 `TransactionTemplate` 으로 트랜잭션을 열고 `tasklet.execute()` 호출 |
+| 4. 커밋 | 같은 트랜잭션 안에서 `stepExecution.apply(contribution)` → Step `ExecutionContext`·`StepExecution` 저장 → 커밋. 업무 DB 변경과 메타데이터 갱신이 함께 커밋·롤백된다 |
+| 5. 종료 | `ExitStatus` 결정 → `listener.afterStep()` → `StepExecution` 저장 → `close()` |
+
+| Step 종류 | 메타데이터에 기록되는 것 (실행 결과) |
+|---|---|
+| `JobStep` | 자기 행은 `COMMIT_COUNT=0`. 실제 작업은 자식 Job의 JobExecution 아래 StepExecution으로 기록 |
+| `FlowStep` | 자기 행은 `COMMIT_COUNT=0`. Flow 안의 Step은 **같은 JobExecution** 아래 기록 |
+
+### 버전 차이
+
+| 항목 | Batch 4.3.3 | Batch 6.0.6 |
+|---|---|---|
+| Step 생성 | `stepBuilderFactory.get(name)` | `new StepBuilder(name, jobRepository)`. 팩토리는 6.0에서 제거 |
+| tasklet 트랜잭션 매니저 | 팩토리가 넣어 준다 | `tasklet(tasklet, transactionManager)`. `tasklet(tasklet)` 은 `ResourcelessTransactionManager` 로 대체되어 Step 안의 DB 작업이 트랜잭션으로 묶이지 않는다 |
+| chunk | `chunk(int)` → `TaskletStep` + `ChunkOrientedTasklet` | `chunk(int)` → `ChunkOrientedStep` (새 모델), 트랜잭션 매니저는 `.transactionManager(...)`. `chunk(int, transactionManager)` 는 deprecated 구 모델 |
+
+### 주의사항
+
+| 주의 | 내용 |
+|---|---|
+| 한도에 걸리기 전의 Step | 4번째 실행에서 step2는 막혔지만 그 앞의 step1(`allowStartIfComplete(true)`)은 **이미 다시 실행됐다**. 한도 검사는 Step마다 실행 직전에 한다 |
+| `allowStartIfComplete(true)` | 재시작할 때마다 다시 실행되므로 부수 효과(파일 생성, insert)가 있으면 멱등하게 만든다 |
+| `startLimit` 세는 기준 | 상태와 상관없이 그 JobInstance에서 Step이 실행된 횟수(`getStepExecutionCount`). `0` 을 넣으면 무제한(`Integer.MAX_VALUE`) |
+| 같은 Step 중복 | 한 Job 안에서 같은 이름의 Step이 두 번 나오면(`step2` 와 `flow` 안의 `step2`) 둘 다 실행되고 INFO 로그 `Duplicate step [step2] detected ... If either step fails, both will be executed again on restart.` 만 남는다 |
+| `CONTINUABLE` 반복 | 반복마다 커밋된다. 여러 테이블 변경을 하나로 묶어야 하면 한 번의 `execute()` 안에서 끝낸다 |
+| 예외를 삼키는 Tasklet | `execute()` 안에서 예외를 잡고 `FINISHED` 를 반환하면 그때까지의 변경이 커밋되고 Step은 `COMPLETED` 다 |
+| `launcher()` 생략 | `JobStepBuilder` 가 같은 `JobRepository` 로 새 `SimpleJobLauncher` 를 만든다. 결과는 같지만 컨테이너 `JobLauncher` 의 설정(예: 비동기 `TaskExecutor`)은 적용되지 않는다 |
+| `jobStep(null)` | `@Configuration` 프록시가 싱글톤 `@Bean` 호출의 `null` 인자를 무시하고 빈을 조회해서 동작한다. `@Bean` 을 빼거나 `proxyBeanMethods = false` 면 `null` 이 그대로 넘어간다 |
+| 자식 Job 파라미터 | 부모 파라미터가 모두 복사되므로 자식 Job의 JobInstance도 부모 파라미터에 따라 정해진다 |
 
 </details>
